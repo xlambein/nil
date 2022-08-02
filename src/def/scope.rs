@@ -113,7 +113,7 @@ impl ModuleScopes {
                 self.traverse_expr(module, *env, scope);
                 let scope = self.scopes.alloc(ScopeData {
                     parent: Some(scope),
-                    kind: ScopeKind::WithEnv(*env),
+                    kind: ScopeKind::WithExpr(expr),
                 });
                 self.traverse_expr(module, *body, scope);
             }
@@ -197,7 +197,7 @@ pub struct ScopeData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScopeKind {
     NameDefs(HashMap<SmolStr, NameDefId>),
-    WithEnv(ExprId),
+    WithExpr(ExprId),
 }
 
 impl ScopeData {
@@ -210,7 +210,7 @@ impl ScopeData {
 
     pub fn as_with(&self) -> Option<ExprId> {
         match self.kind {
-            ScopeKind::WithEnv(expr) => Some(expr),
+            ScopeKind::WithExpr(expr) => Some(expr),
             _ => None,
         }
     }
@@ -231,8 +231,8 @@ impl NameReferenceMap {
         module
             .exprs()
             // N.B. Inherited attrs are also translated into Expr::References.
-            // This should cover all cases.
-            .filter(|(_, kind)| matches!(kind, Expr::Reference(_)))
+            // This should cover all direct (defined name) and indirect (catch-all "with") references.
+            .filter(|(_, kind)| matches!(kind, Expr::Reference(_) | Expr::With(..)))
             .map(|(expr, _)| expr)
             .filter_map(|expr| Some((expr, db.resolve_name(file_id, expr)?.as_name_def()?)))
             .for_each(|(expr, def)| match this.map.get_mut(def) {
@@ -285,7 +285,7 @@ mod tests {
                     names.sort();
                     names.join(" ")
                 }
-                &ScopeKind::WithEnv(expr) => {
+                &ScopeKind::WithExpr(expr) => {
                     let pos = source_map.expr_node(expr).unwrap().text_range().start();
                     format!("with@{}", u32::from(pos))
                 }
@@ -338,11 +338,16 @@ mod tests {
     #[track_caller]
     fn check_refs(fixture: &str, expect: &[u32]) {
         let (db, file_id, [pos]) = TestDB::single_file(fixture).unwrap();
-        let ptr = AstPtr::new(
-            db.node_at::<ast::Attr>(file_id, pos)
-                .expect("No Attr node")
-                .syntax(),
-        );
+        let ptr = db.find_node(file_id, pos, |node| {
+            match_ast! {
+                match node {
+                    ast::Attr(n) => Some(AstPtr::new(n.syntax())),
+                    ast::With(n) => Some(AstPtr::new(n.syntax())),
+                    _ => None,
+                }
+            }
+        })
+                .expect("No Attr or With node");
         let source_map = db.source_map(file_id);
         let def = source_map.node_name_def(ptr).expect("Not a name def");
 
@@ -379,14 +384,14 @@ mod tests {
     fn with() {
         check_scopes(
             r"a: with b; c: with c; $0a (d: with e; a)",
-            expect!["with@19 | c@11 | with@8 | a@0"],
+            expect!["with@14 | c@11 | with@3 | a@0"],
         );
 
         check_resolve(r"$1a: with b; c: $0a");
         check_resolve(r"a: with b; $1c: $0c");
-        check_resolve(r"a: with $1b; c: $0x");
+        check_resolve(r"a: $1with b; c: $0x");
         check_resolve(r"$1x: with a; with b; $0x");
-        check_resolve(r"x: with a; with $1b; $0y");
+        check_resolve(r"x: with a; $1with b; $0y");
     }
 
     #[test]
@@ -440,21 +445,42 @@ mod tests {
     fn builtin() {
         check_resolve("let $1true = 1; in with x; $0true + false + falsie");
         check_resolve("let true = 1; in with x; true + $0$1false + falsie");
-        check_resolve("let true = 1; in with $1x; true + false + $0falsie");
+        check_resolve("let true = 1; in $1with x; true + false + $0falsie");
     }
 
     #[test]
-    fn references() {
+    fn let_references() {
         check_refs("let $0a = 1; b = 1; in a", &[21]);
         check_refs("let a = 1; $0b = 1; in a", &[]);
+        check_refs("let $0a.b = a.c; in 1", &[10]);
+    }
 
+    #[test]
+    fn rec_references() {
         check_refs("rec { inherit (b) $0a; b = a; }", &[25]);
         check_refs("rec { inherit (b) a; $0b = a; }", &[15]);
+        check_refs("rec { $0a.b = a.c; }", &[12]);
+    }
 
+    #[test]
+    fn inherit_references() {
         check_refs(r#"let $0" " = 1; in { inherit " "; }"#, &[26]);
         check_refs(
             r#"let " " = 1; in rec { inherit $0" "; x = { inherit ${" "}; }; }"#,
             &[49],
         );
+    }
+
+    #[test]
+    fn param_references() {
+        check_refs("$0a@{ b ? c, c ? a }: b", &[15]);
+        check_refs("a@{ $0b ? c, c ? a }: b", &[20]);
+        check_refs("a@{ b ? c, $0c ? a }: b", &[8]);
+    }
+
+    #[test]
+    fn with_references() {
+        check_refs("a: with $0{}; a", &[]);
+        check_refs("a: with $0{}; b", &[12]);
     }
 }
