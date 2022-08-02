@@ -68,12 +68,12 @@ impl ModuleScopes {
             return Some(ResolveResult::Builtin(name));
         }
         // 3. "with" exprs.
-        let envs = self
+        let withs = self
             .ancestors(scope)
             .filter_map(|data| data.as_with())
             .collect::<Vec<_>>();
-        if !envs.is_empty() {
-            return Some(ResolveResult::WithEnvs(envs));
+        if !withs.is_empty() {
+            return Some(ResolveResult::WithExprs(withs));
         }
         None
     }
@@ -176,7 +176,7 @@ impl ModuleScopes {
 pub enum ResolveResult {
     NameDef(NameDefId),
     Builtin(&'static str),
-    WithEnvs(Vec<ExprId>),
+    WithExprs(Vec<ExprId>),
 }
 
 impl ResolveResult {
@@ -323,8 +323,9 @@ mod tests {
                 .to_node(&parse.syntax_node())
                 .text_range()
                 .start(),
-            ResolveResult::WithEnvs(env) => source_map
-                .expr_node(env[0])
+            ResolveResult::WithExprs(expr) => source_map
+                // Test the innermost one.
+                .expr_node(expr[0])
                 .unwrap()
                 .to_node(&parse.syntax_node())
                 .text_range()
@@ -338,16 +339,17 @@ mod tests {
     #[track_caller]
     fn check_refs(fixture: &str, expect: &[u32]) {
         let (db, file_id, [pos]) = TestDB::single_file(fixture).unwrap();
-        let ptr = db.find_node(file_id, pos, |node| {
-            match_ast! {
-                match node {
-                    ast::Attr(n) => Some(AstPtr::new(n.syntax())),
-                    ast::With(n) => Some(AstPtr::new(n.syntax())),
-                    _ => None,
+        let ptr = db
+            .find_node(file_id, pos, |node| {
+                match_ast! {
+                    match node {
+                        ast::Attr(n) => Some(AstPtr::new(n.syntax())),
+                        ast::With(n) => Some(AstPtr::new(n.syntax())),
+                        _ => None,
+                    }
                 }
-            }
-        })
-                .expect("No Attr or With node");
+            })
+            .expect("No Attr or With node");
         let source_map = db.source_map(file_id);
         let def = source_map.node_name_def(ptr).expect("Not a name def");
 
