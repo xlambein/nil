@@ -1,14 +1,15 @@
 use crate::config::{Config, CONFIG_KEY};
-use crate::{convert, handler, LspError, Vfs};
+use crate::{convert, handler, LspError, UrlExt, Vfs};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use ide::{Analysis, AnalysisHost, Cancelled, FileId, VfsPath};
 use lsp_server::{ErrorCode, Message, Notification, ReqQueue, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::{
-    notification as notif, request as req, ConfigurationItem, ConfigurationParams, Diagnostic,
-    InitializeParams, MessageType, NumberOrString, PublishDiagnosticsParams, ShowMessageParams,
-    Url,
+    notification as notif, request as req, ClientCapabilities, ConfigurationItem,
+    ConfigurationParams, Diagnostic, DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher,
+    InitializeParams, MessageType, NumberOrString, PublishDiagnosticsParams, Registration,
+    RegistrationParams, ShowMessageParams, Url,
 };
 use nix_interop::{flake_lock, FLAKE_FILE, FLAKE_LOCK_FILE};
 use std::cell::Cell;
@@ -50,6 +51,10 @@ pub struct Server {
     task_tx: Sender<Task>,
     event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
+
+    // Immutable config.
+    /// Initialized in `run`.
+    client_capabilities: ClientCapabilities,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +91,8 @@ impl Server {
             task_tx,
             event_tx,
             event_rx,
+
+            client_capabilities: ClientCapabilities::default(),
         }
     }
 
@@ -141,8 +148,49 @@ impl Server {
             });
         }
 
-        // TODO: Register file watcher for flake.lock.
-        self.load_flake();
+        self.client_capabilities = init_params.capabilities;
+
+        // Watch the flake lock file if the client supports file watching,
+        // before loading workspace.
+        if (|| {
+            self.client_capabilities
+                .workspace
+                .as_ref()?
+                .did_change_watched_files
+                .as_ref()?
+                .dynamic_registration?
+                .then_some(())
+        })() == Some(())
+        {
+            let register_option = DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![FileSystemWatcher {
+                    glob_pattern: FLAKE_LOCK_FILE.into(),
+                    // Watch for every kinds.
+                    kind: None,
+                }],
+            };
+            let reg_param = RegistrationParams {
+                registrations: vec![Registration {
+                    id: notif::DidChangeWatchedFiles::METHOD.into(),
+                    method: notif::DidChangeWatchedFiles::METHOD.into(),
+                    register_options: Some(serde_json::to_value(register_option).unwrap()),
+                }],
+            };
+            self.send_request::<req::RegisterCapability>(reg_param, |this, resp| {
+                if let Some(err) = resp.error {
+                    tracing::error!("Cannot watch flake lock: {err:?}");
+                    // Fallthrough. Always load even if file watching failed.
+                } else {
+                    tracing::error!("Registered file watching for flake lock: {resp:?}");
+                }
+                this.load_flake();
+            });
+
+        // If file watching is not supported by the client, load the lock now.
+        // TODO: Fallback to inotify?
+        } else {
+            self.load_flake();
+        }
 
         loop {
             crossbeam_channel::select! {
@@ -325,10 +373,18 @@ impl Server {
                 );
                 Ok(())
             })?
-            .on_sync_mut::<notif::DidChangeWatchedFiles>(|_st, _params| {
-                // Workaround:
-                // > In former implementations clients pushed file events without the server actively asking for it.
-                // Ref: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_didChangeWatchedFiles
+            // NB: This should always be handled even if it's not used.
+            // From: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspace_didChangeWatchedFiles
+            // > In former implementations clients pushed file events without the server actively asking for it.
+            .on_sync_mut::<notif::DidChangeWatchedFiles>(|st, params| {
+                if params.changes.iter().any(|event| {
+                    event
+                        .uri
+                        .to_vfs_path()
+                        .map_or(false, |vpath| vpath.as_str().ends_with("flake.lock"))
+                }) {
+                    st.load_flake();
+                }
                 Ok(())
             })?
             .finish()
