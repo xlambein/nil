@@ -2,7 +2,7 @@ use crate::config::{Config, CONFIG_KEY};
 use crate::{convert, handler, LspError, Vfs};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
-use ide::{Analysis, AnalysisHost, Cancelled};
+use ide::{Analysis, AnalysisHost, Cancelled, FileId, VfsPath};
 use lsp_server::{ErrorCode, Message, Notification, ReqQueue, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
 use lsp_types::{
@@ -10,12 +10,13 @@ use lsp_types::{
     InitializeParams, MessageType, NumberOrString, PublishDiagnosticsParams, ShowMessageParams,
     Url,
 };
+use nix_interop::{flake_lock, FLAKE_FILE, FLAKE_LOCK_FILE};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::UnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Once, RwLock};
-use std::{panic, thread};
+use std::{fs, panic, thread};
 
 type ReqHandler = fn(&mut Server, Response);
 
@@ -29,6 +30,7 @@ enum Event {
         diagnostics: Vec<Diagnostic>,
     },
     ClientExited,
+    LoadFlake(Result<Option<(FileId, HashMap<String, String>)>>),
 }
 
 pub struct Server {
@@ -139,6 +141,9 @@ impl Server {
             });
         }
 
+        // TODO: Register file watcher for flake.lock.
+        self.load_flake();
+
         loop {
             crossbeam_channel::select! {
                 recv(lsp_rx) -> msg => {
@@ -193,6 +198,24 @@ impl Server {
             },
             Event::ClientExited => {
                 bail!("The process initializing this server is exited. Exit now")
+            }
+            Event::LoadFlake(ret) => {
+                match ret {
+                    Err(err) => {
+                        self.show_message(
+                            MessageType::ERROR,
+                            format!("Failed to load workspace: {err}"),
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!("Workspace is not a flake");
+                        // TODO
+                    }
+                    Ok(Some((_flake_file, inputs))) => {
+                        tracing::info!("Workspace is a flake with inputs {inputs:?}");
+                        // TODO
+                    }
+                }
             }
         }
         Ok(())
@@ -309,6 +332,51 @@ impl Server {
                 Ok(())
             })?
             .finish()
+    }
+
+    /// Enqueue a task to reload the flake.{nix,lock} and the locked inputs.
+    fn load_flake(&self) {
+        tracing::info!("Loading flake configuration");
+
+        let def_path = self.config.root_path.join(FLAKE_FILE);
+        let lock_path = self.config.root_path.join(FLAKE_LOCK_FILE);
+        let vfs = self.vfs.clone();
+        let task = move || {
+            if !def_path.exists() {
+                // No flake found.
+                return Event::LoadFlake(Ok(None));
+            }
+            Event::LoadFlake((|| {
+                let def_vpath = VfsPath::try_from(&*def_path)?;
+                let def_src = fs::read_to_string(&def_path)
+                    .with_context(|| format!("Failed to read flake root {def_path:?}"))?;
+                let def_file = {
+                    let mut vfs = vfs.write().unwrap();
+                    match vfs.file_for_path(&def_vpath) {
+                        // If the file is already opened (transferred from client),
+                        // prefer the managed one. It contains more recent unsaved changes.
+                        Ok(file) => file,
+                        // Otherwise, cache the file content from disk.
+                        Err(_) => vfs.set_path_content(def_vpath, def_src)?,
+                    }
+                };
+
+                let lock_src = fs::read(&lock_path)?;
+
+                // TODO: Customize the command to Nix binary.
+                let inputs = flake_lock::resolve_flake_locked_inputs("nix".as_ref(), &lock_src)
+                    .context("Failed to resolve flake inputs from lock file")?;
+
+                // We only need the map for input -> store path.
+                let inputs = inputs
+                    .into_iter()
+                    .map(|(key, input)| (key, input.store_path))
+                    .collect();
+
+                Ok(Some((def_file, inputs)))
+            })())
+        };
+        self.task_tx.send(Box::new(task)).unwrap();
     }
 
     fn send_request<R: req::Request>(
